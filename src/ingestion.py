@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from io import BytesIO, StringIO
-from typing import Iterable, Optional
+from typing import Iterable, Optional, List
+import tempfile
+import os
 
 import pandas as pd
 
@@ -67,11 +69,11 @@ def _infer_date(df: pd.DataFrame) -> pd.Series:
     if not date_col:
         # Attempt to parse any column that looks like a date
         for c in df.columns:
-            parsed = pd.to_datetime(df[c], errors="coerce", utc=False, dayfirst=False, infer_datetime_format=True)
+            parsed = pd.to_datetime(df[c], errors="coerce", utc=False, dayfirst=False)
             if parsed.notna().sum() >= max(1, int(len(df) * 0.5)):
                 return parsed.dt.date
         raise ValueError("Could not infer date column.")
-    parsed = pd.to_datetime(df[date_col], errors="coerce", utc=False, dayfirst=False, infer_datetime_format=True)
+    parsed = pd.to_datetime(df[date_col], errors="coerce", utc=False, dayfirst=False)
     return parsed.dt.date
 
 
@@ -116,3 +118,126 @@ def load_transactions_from_csv(file_like: BytesIO | StringIO) -> pd.DataFrame:
     normalized = normalized.sort_values("date").reset_index(drop=True)
 
     return normalized
+
+
+# --------------------------
+# PDF ingestion
+# --------------------------
+
+def _normalize_extracted_table(raw_df: pd.DataFrame) -> Optional[pd.DataFrame]:
+    """Attempt to normalize a raw extracted PDF table to date/description/amount."""
+    if raw_df is None or raw_df.empty:
+        return None
+
+    candidates: List[pd.DataFrame] = []
+
+    # Strategy 1: assume current columns are headers
+    df1 = raw_df.copy()
+    df1.columns = _standardize_columns(df1.columns)
+    candidates.append(df1)
+
+    # Strategy 2: first row as header
+    if len(raw_df) > 1:
+        header = _standardize_columns(list(raw_df.iloc[0].astype(str)))
+        df2 = raw_df.iloc[1:].copy()
+        df2.columns = header
+        candidates.append(df2)
+
+    # Try each candidate
+    for trial in candidates:
+        try:
+            date_series = _infer_date(trial)
+            description_series = _infer_description(trial)
+            amount_series = _infer_amount(trial)
+            normalized = pd.DataFrame({
+                "date": pd.to_datetime(date_series, errors="coerce").dt.date,
+                "description": description_series.fillna("").astype(str).str.strip(),
+                "amount": pd.to_numeric(amount_series, errors="coerce"),
+            })
+            normalized = normalized.dropna(subset=["date", "amount"]).reset_index(drop=True)
+            if not normalized.empty:
+                return normalized
+        except Exception:
+            continue
+    return None
+
+
+def _extract_with_camelot(pdf_path: str) -> List[pd.DataFrame]:
+    try:
+        import camelot  # type: ignore
+    except Exception:
+        return []
+    frames: List[pd.DataFrame] = []
+    try:
+        for flavor in ("stream", "lattice"):
+            try:
+                tables = camelot.read_pdf(pdf_path, pages="all", flavor=flavor)
+                for t in tables:
+                    frames.append(t.df)
+                if frames:
+                    break
+            except Exception:
+                continue
+    except Exception:
+        return []
+    return frames
+
+
+def _extract_with_tabula(pdf_path: str) -> List[pd.DataFrame]:
+    try:
+        import tabula  # type: ignore
+    except Exception:
+        return []
+    frames: List[pd.DataFrame] = []
+    try:
+        dfs = tabula.read_pdf(pdf_path, pages="all", multiple_tables=True, lattice=True, stream=True)
+        if isinstance(dfs, list):
+            frames.extend(dfs)
+    except Exception:
+        try:
+            dfs = tabula.read_pdf(pdf_path, pages="all", multiple_tables=True)
+            if isinstance(dfs, list):
+                frames.extend(dfs)
+        except Exception:
+            return []
+    return frames
+
+
+def load_transactions_from_pdf(file_like: BytesIO) -> pd.DataFrame:
+    """
+    Parse a PDF file-like object containing bank statement tables into a standardized DataFrame
+    with columns [date, description, amount]. Tries Camelot first, then Tabula.
+    """
+    # Persist to temp file, as extractors expect a path
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+        tmp.write(file_like.read())
+        tmp_path = tmp.name
+
+    try:
+        extracted_frames: List[pd.DataFrame] = []
+        # Try Camelot
+        extracted_frames.extend(_extract_with_camelot(tmp_path))
+        # Fallback to Tabula if nothing
+        if not extracted_frames:
+            extracted_frames.extend(_extract_with_tabula(tmp_path))
+
+        normalized_frames: List[pd.DataFrame] = []
+        for raw in extracted_frames:
+            norm = _normalize_extracted_table(raw)
+            if norm is not None and not norm.empty:
+                normalized_frames.append(norm)
+
+        if not normalized_frames:
+            raise RuntimeError("No transaction-like tables found in PDF.")
+
+        result = pd.concat(normalized_frames, ignore_index=True)
+        # Deduplicate
+        result = result.drop_duplicates(subset=["date", "description", "amount"]).reset_index(drop=True)
+        # Sort
+        result = result.sort_values("date").reset_index(drop=True)
+        return result
+    finally:
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
