@@ -4,13 +4,14 @@ import pandas as pd
 st.set_page_config(page_title="AI Financial Planner", layout="wide")
 
 st.title("AI Financial Planner")
-st.caption("Iteration 5 — Categorization and dashboard visuals.")
+st.caption("Iteration 6 — AI financial advice with graceful fallbacks.")
 
 # Lazy imports for app sections
 from src.storage import initialize as init_storage, dataframe_to_transactions, fetch_all_transactions, upsert_transactions
 from src.db import get_session
 from src.categorization import apply_categories
 from src.dashboard import pie_spending_by_category, line_monthly_trend, debt_payoff_schedule, savings_goal_months
+from src.ai_advisor import generate_advice, OpenAISettings, LlamaSettings
 
 # Initialize DB once per app startup
 @st.cache_resource
@@ -127,4 +128,33 @@ with TAB_UPLOAD:
 
 with TAB_AI:
     st.header("AI Advice")
-    st.info("AI-driven financial recommendations will be added in iteration 6.")
+    st.write("Select a provider or run offline with a static summary.")
+
+    provider = st.selectbox("AI Provider", options=["none", "openai", "llama"], index=0, help="Choose 'none' to skip AI and show guidance without generation.")
+    user_notes = st.text_area("Optional notes (e.g., goals, constraints)", placeholder="e.g., Save $300/month, pay off credit card by December")
+
+    openai_model = st.text_input("OpenAI model", value="gpt-4o-mini", disabled=(provider != "openai"))
+    llama_model_path = st.text_input("llama model path (GGUF)", value="", disabled=(provider != "llama"))
+
+    if st.button("Generate Advice"):
+        with get_session() as session:
+            df_tx = fetch_all_transactions(session)
+        if df_tx.empty:
+            st.warning("No transactions stored yet.")
+        else:
+            advice, error = generate_advice(
+                df_tx,
+                provider=provider,
+                user_notes=user_notes,
+                openai_settings=OpenAISettings(model=openai_model),
+                llama_settings=LlamaSettings(model_path=llama_model_path),
+            )
+            if advice:
+                st.subheader("Recommendations")
+                st.write(advice)
+            else:
+                st.info("AI is unavailable or not selected. Showing a static summary instead.")
+                # Fallback static guidance
+                st.write("- Track your top 3 spending categories and set monthly budgets.\n- Automate savings transfers on payday.\n- Prioritize high-interest debt with a fixed extra payment each month.\n- Review subscriptions and cancel unused services.\n- Build an emergency fund covering 3–6 months of expenses.")
+                if error:
+                    st.caption(f"Note: {error}")
