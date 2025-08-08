@@ -1,0 +1,11 @@
+pandas
+plotly
+streamlit
+camelot-py
+tabula-py
+SQLAlchemy
+scikit-learn
+python-dateutil
+# Optional model connectors (choose one or both as needed)
+# openai>=1.0.0
+# llama-cpp-python
